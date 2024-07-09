@@ -2692,7 +2692,11 @@ namespace ICSharpCode.Decompiler.CSharp.OutputVisitor
 					propertyDeclaration.Initializer.AcceptVisitor(this);
 					Semicolon();
 				}
-				NewLine();
+				else
+				{
+					// The call to Semicolon() above prints a newline too
+					NewLine();
+				}
 			}
 			else
 			{
