@@ -160,6 +160,10 @@ namespace ICSharpCode.Decompiler
 				unsignedRightShift = false;
 				checkedOperators = false;
 			}
+			if (languageVersion < CSharp.LanguageVersion.CSharp12_0)
+			{
+
+			}
 		}
 
 		public CSharp.LanguageVersion GetMinimumRequiredVersion()
