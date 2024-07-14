@@ -16,17 +16,14 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 
-using ICSharpCode.Decompiler.CSharp.Resolver;
 using ICSharpCode.Decompiler.CSharp.Syntax;
 using ICSharpCode.Decompiler.CSharp.Syntax.PatternMatching;
+using ICSharpCode.Decompiler.IL;
 using ICSharpCode.Decompiler.TypeSystem;
-
-using SRM = System.Reflection.Metadata;
 
 namespace ICSharpCode.Decompiler.CSharp.Transforms
 {
@@ -36,104 +33,55 @@ namespace ICSharpCode.Decompiler.CSharp.Transforms
 	/// </summary>
 	public class TransformFieldAndConstructorInitializers : DepthFirstAstVisitor, IAstTransform
 	{
-		TransformContext context;
-
-		public void Run(AstNode node, TransformContext context)
+		record MemberTransformInfo(IMember Member, AstNode Syntax)
 		{
-			this.context = context;
+			public List<Statement> StatementsToRemove { get; set; } = new List<Statement>();
+			public Expression Initializer { get; set; }
+			public bool CanMoveInitializer { get; set; } = true;
+			public RecordDecompiler Record { get; set; }
+			public bool IsPrimaryCtor { get; set; }
 
-			try
+			public bool IsMemberDeclaredByPrimaryConstructor()
 			{
-				// If we're viewing some set of members (fields are direct children of SyntaxTree),
-				// we also need to handle those:
-				HandleInstanceFieldInitializers(node.Children);
-				HandleStaticFieldInitializers(node.Children);
-
-				node.AcceptVisitor(this);
-
-				RemoveSingleEmptyConstructor(node.Children, context.CurrentTypeDefinition);
-			}
-			finally
-			{
-				this.context = null;
-			}
-		}
-
-		public override void VisitConstructorDeclaration(ConstructorDeclaration constructorDeclaration)
-		{
-			var currentCtor = (IMethod)constructorDeclaration.GetSymbol();
-			ConstructorInitializer ci = null;
-			if (constructorDeclaration.Body.Statements.FirstOrDefault() is ExpressionStatement stmt)
-			{
-				switch (stmt.Expression)
+				if (Record != null)
 				{
-					// Pattern for reference types:
-					// this..ctor(...);
-					case InvocationExpression invocation:
-						if (!(invocation.Target is MemberReferenceExpression mre) || mre.MemberName != ".ctor")
-							return;
-						if (!(invocation.GetSymbol() is IMethod ctor && ctor.IsConstructor))
-							return;
-						ci = new ConstructorInitializer();
-						var target = mre.Target;
-						// Ignore casts, those might be added if references are missing.
-						if (target is CastExpression cast)
-							target = cast.Expression;
-						if (target is ThisReferenceExpression or BaseReferenceExpression)
+					if (Member is IProperty p && Record.IsPropertyDeclaredByPrimaryConstructor(p))
+						return true;
+				}
+
+				return false;
+			}
+
+			public bool CanMoveExpressionToTypeLevel()
+			{
+				if (Initializer == null)
+					return false;
+
+				var instruction = Initializer.Annotation<ILInstruction>();
+
+				if (instruction == null)
+					return true;
+
+				foreach (var i in instruction.Descendants)
+				{
+					if (i is ILoadInstruction load)
+					{
+						var f = load.Variable.Function.Method;
+						if (load.Variable.Kind.IsLocal() || load.Variable.Kind == VariableKind.Parameter)
 						{
-							if (ctor.DeclaringTypeDefinition == currentCtor.DeclaringTypeDefinition)
-								ci.ConstructorInitializerType = ConstructorInitializerType.This;
-							else
-								ci.ConstructorInitializerType = ConstructorInitializerType.Base;
+							if (f.IsConstructor)
+							{
+								return false;
+							}
 						}
-						else
-							return;
-						// Move arguments from invocation to initializer:
-						invocation.Arguments.MoveTo(ci.Arguments);
-						// Add the initializer: (unless it is the default 'base()')
-						if (!(ci.ConstructorInitializerType == ConstructorInitializerType.Base && ci.Arguments.Count == 0))
-							constructorDeclaration.Initializer = ci.CopyAnnotationsFrom(invocation);
-						// Remove the statement:
-						stmt.Remove();
-						break;
-					// Pattern for value types:
-					// this = new TSelf(...);
-					case AssignmentExpression assignment:
-						if (!(assignment.Right is ObjectCreateExpression oce && oce.GetSymbol() is IMethod ctor2 && ctor2.DeclaringTypeDefinition == currentCtor.DeclaringTypeDefinition))
-							return;
-						ci = new ConstructorInitializer();
-						if (assignment.Left is ThisReferenceExpression)
-							ci.ConstructorInitializerType = ConstructorInitializerType.This;
-						else
-							return;
-						// Move arguments from invocation to initializer:
-						oce.Arguments.MoveTo(ci.Arguments);
-						// Add the initializer: (unless it is the default 'base()')
-						if (!(ci.ConstructorInitializerType == ConstructorInitializerType.Base && ci.Arguments.Count == 0))
-							constructorDeclaration.Initializer = ci.CopyAnnotationsFrom(oce);
-						// Remove the statement:
-						stmt.Remove();
-						break;
-					default:
-						return;
+					}
 				}
-			}
-			if (context.DecompileRun.RecordDecompilers.TryGetValue(currentCtor.DeclaringTypeDefinition, out var record)
-				&& currentCtor.Equals(record.PrimaryConstructor))
-			{
-				if (record.IsInheritedRecord &&
-					ci?.ConstructorInitializerType == ConstructorInitializerType.Base &&
-					constructorDeclaration.Parent is TypeDeclaration { BaseTypes: { Count: >= 1 } } typeDecl)
-				{
-					var baseType = typeDecl.BaseTypes.First();
-					var newBaseType = new InvocationAstType();
-					baseType.ReplaceWith(newBaseType);
-					newBaseType.BaseType = baseType;
-					ci.Arguments.MoveTo(newBaseType.Arguments);
-				}
-				constructorDeclaration.Remove();
+
+				return Member.DeclaringTypeDefinition.Kind != TypeKind.Struct || Record?.PrimaryConstructor != null;
 			}
 		}
+
+		record AnalysisResult(Dictionary<IMember, MemberTransformInfo> TransformInfo);
 
 		static readonly ExpressionStatement fieldInitializerPattern = new ExpressionStatement {
 			Expression = new AssignmentExpression {
@@ -149,299 +97,378 @@ namespace ICSharpCode.Decompiler.CSharp.Transforms
 			}
 		};
 
-		static readonly AstNode thisCallPattern = new ExpressionStatement(new InvocationExpression(new MemberReferenceExpression(new ThisReferenceExpression(), ".ctor"), new Repeat(new AnyNode())));
+		static readonly ExpressionStatement ctorCallPattern = new ExpressionStatement(
+			new Choice {
+				new InvocationExpression(new MemberReferenceExpression(new Choice {
+					new ThisReferenceExpression(),
+					new BaseReferenceExpression(),
+					new CastExpression(new AnyNode(), new ThisReferenceExpression()),
+				}, ".ctor"), new Repeat(new AnyNode())),
+				new AssignmentExpression(new ThisReferenceExpression(), new ObjectCreateExpression(new AnyNode("type"), new Repeat(new AnyNode())))
+			}
+		);
 
-		public override void VisitTypeDeclaration(TypeDeclaration typeDeclaration)
+		TransformContext context;
+
+		public void Run(AstNode node, TransformContext context)
 		{
-			// Handle initializers on instance fields
-			HandleInstanceFieldInitializers(typeDeclaration.Members);
+			this.context = context;
 
-			// Now convert base constructor calls to initializers:
-			base.VisitTypeDeclaration(typeDeclaration);
-
-			// Remove single empty constructor:
-			RemoveSingleEmptyConstructor(typeDeclaration.Members, (ITypeDefinition)typeDeclaration.GetSymbol());
-
-			// Handle initializers on static fields:
-			HandleStaticFieldInitializers(typeDeclaration.Members);
-		}
-
-		void HandleInstanceFieldInitializers(IEnumerable<AstNode> members)
-		{
-			var instanceCtors = members.OfType<ConstructorDeclaration>().Where(c => (c.Modifiers & Modifiers.Static) == 0).ToArray();
-			var instanceCtorsNotChainingWithThis = instanceCtors.Where(ctor => !thisCallPattern.IsMatch(ctor.Body.Statements.FirstOrDefault())).ToArray();
-			if (instanceCtorsNotChainingWithThis.Length > 0)
+			try
 			{
-				var ctorMethodDef = instanceCtorsNotChainingWithThis[0].GetSymbol() as IMethod;
-				ITypeDefinition declaringTypeDefinition = ctorMethodDef?.DeclaringTypeDefinition;
-				if (ctorMethodDef != null && declaringTypeDefinition?.IsReferenceType == false && !declaringTypeDefinition.IsRecord)
-					return;
+				var result = Analyze(node.Children, context.CurrentTypeDefinition);
+				ApplyTransform(result);
 
-				bool ctorIsUnsafe = instanceCtorsNotChainingWithThis.All(c => c.HasModifier(Modifiers.Unsafe));
-
-				if (!context.DecompileRun.RecordDecompilers.TryGetValue(ctorMethodDef.DeclaringTypeDefinition, out var record))
-					record = null;
-
-				// Filter out copy constructor of records
-				if (record != null)
-					instanceCtorsNotChainingWithThis = instanceCtorsNotChainingWithThis.Where(ctor => !record.IsCopyConstructor(ctor.GetSymbol() as IMethod)).ToArray();
-
-				// Recognize field or property initializers:
-				// Translate first statement in all ctors (if all ctors have the same statement) into an initializer.
-				bool allSame;
-				bool isStructPrimaryCtor = false;
-				do
-				{
-					Match m = fieldInitializerPattern.Match(instanceCtorsNotChainingWithThis[0].Body.FirstOrDefault());
-					if (!m.Success)
-						break;
-					IMember fieldOrPropertyOrEvent = (m.Get<AstNode>("fieldAccess").Single().GetSymbol() as IMember)?.MemberDefinition;
-					if (!(fieldOrPropertyOrEvent is IField) && !(fieldOrPropertyOrEvent is IProperty) && !(fieldOrPropertyOrEvent is IEvent))
-						break;
-					var fieldOrPropertyOrEventDecl = members.FirstOrDefault(f => f.GetSymbol() == fieldOrPropertyOrEvent) as EntityDeclaration;
-					// Cannot transform if it is a custom event.
-					if (fieldOrPropertyOrEventDecl is CustomEventDeclaration)
-						break;
-
-
-					Expression initializer = m.Get<Expression>("initializer").Single();
-					// 'this'/'base' cannot be used in initializers
-					if (initializer.DescendantsAndSelf.Any(n => n is ThisReferenceExpression || n is BaseReferenceExpression))
-						break;
-
-					if (initializer.Annotation<ILVariableResolveResult>()?.Variable.Kind == IL.VariableKind.Parameter)
-					{
-						// remove record ctor parameter assignments
-						if (!IsPropertyDeclaredByPrimaryCtor(fieldOrPropertyOrEvent as IProperty, record))
-							break;
-						isStructPrimaryCtor = true;
-					}
-					else
-					{
-						// cannot transform if member is not found
-						if (fieldOrPropertyOrEventDecl == null)
-							break;
-						// or if this is a struct record, but not the primary ctor
-						if (declaringTypeDefinition.IsRecord && declaringTypeDefinition.IsReferenceType == false && !isStructPrimaryCtor)
-							break;
-					}
-
-					allSame = true;
-					for (int i = 1; i < instanceCtorsNotChainingWithThis.Length; i++)
-					{
-						var otherMatch = fieldInitializerPattern.Match(instanceCtorsNotChainingWithThis[i].Body.FirstOrDefault());
-						if (!otherMatch.Success)
-						{
-							allSame = false;
-							break;
-						}
-						var otherMember = (otherMatch.Get<AstNode>("fieldAccess").Single().GetSymbol() as IMember)?.MemberDefinition;
-						if (!otherMember.Equals(fieldOrPropertyOrEvent))
-							allSame = false;
-						if (!initializer.IsMatch(otherMatch.Get<AstNode>("initializer").Single()))
-							allSame = false;
-					}
-					if (allSame)
-					{
-						foreach (var ctor in instanceCtorsNotChainingWithThis)
-							ctor.Body.First().Remove();
-						if (fieldOrPropertyOrEventDecl == null)
-							continue;
-						if (ctorIsUnsafe && IntroduceUnsafeModifier.IsUnsafe(initializer))
-						{
-							fieldOrPropertyOrEventDecl.Modifiers |= Modifiers.Unsafe;
-						}
-						if (fieldOrPropertyOrEventDecl is PropertyDeclaration pd)
-						{
-							pd.Initializer = initializer.Detach();
-						}
-						else
-						{
-							fieldOrPropertyOrEventDecl.GetChildrenByRole(Roles.Variable).Single().Initializer = initializer.Detach();
-						}
-					}
-				} while (allSame);
+				node.AcceptVisitor(this);
+			}
+			finally
+			{
+				this.context = null;
 			}
 		}
 
-		bool IsPropertyDeclaredByPrimaryCtor(IProperty p, RecordDecompiler record)
+		AnalysisResult Analyze(IEnumerable<AstNode> nodes, ITypeDefinition currentType)
 		{
-			if (p == null || record == null)
-				return false;
-			return record.IsPropertyDeclaredByPrimaryConstructor(p);
-		}
-
-		void RemoveSingleEmptyConstructor(IEnumerable<AstNode> members, ITypeDefinition contextTypeDefinition)
-		{
-			// if we're outside of a type definition skip this altogether
-			if (contextTypeDefinition == null)
-				return;
-			// first get non-static constructor declarations from the AST
-			var instanceCtors = members.OfType<ConstructorDeclaration>().Where(c => (c.Modifiers & Modifiers.Static) == 0).ToArray();
-			// if there's exactly one ctor and it's part of a type declaration or there's more than one member in the current selection
-			// we can remove the constructor. (We do not want to hide the constructor if the user explicitly selected it in the tree view.) 
-			if (instanceCtors.Length == 1 && (instanceCtors[0].Parent is TypeDeclaration || members.Skip(1).Any()))
+			// Set up a list of members to process
+			Dictionary<IMember, MemberTransformInfo> info = new();
+			foreach (var node in nodes)
 			{
-				var ctor = instanceCtors[0];
-				// dynamically create a pattern of an empty ctor
-				ConstructorDeclaration emptyCtorPattern = new ConstructorDeclaration();
-				emptyCtorPattern.Modifiers = contextTypeDefinition.IsAbstract ? Modifiers.Protected : Modifiers.Public;
-				if (ctor.HasModifier(Modifiers.Unsafe))
-					emptyCtorPattern.Modifiers |= Modifiers.Unsafe;
-				emptyCtorPattern.Body = new BlockStatement();
-
-				if (emptyCtorPattern.IsMatch(ctor))
+				if (node.GetSymbol() is not IEntity member)
+					continue;
+				MemberTransformInfo i;
+				switch (member)
 				{
-					bool retainBecauseOfDocumentation = ctor.GetSymbol() is IMethod ctorMethod
-						&& context.Settings.ShowXmlDocumentation
-						&& context.DecompileRun.DocumentationProvider?.GetDocumentation(ctorMethod) != null;
-					if (!retainBecauseOfDocumentation)
-						ctor.Remove();
+					case IField _:
+					case IEvent _ when node is not CustomEventDeclaration:
+						i = new MemberTransformInfo((IMember)member, node) {
+							Initializer = node.GetChildByRole(Roles.Variable).Initializer
+						};
+						if (context.DecompileRun.RecordDecompilers.TryGetValue(member.DeclaringTypeDefinition, out var r))
+						{
+							i.Record = r;
+						}
+						info.Add((IMember)member, i);
+						break;
+					case IProperty _:
+						i = new MemberTransformInfo((IMember)member, node) {
+							Initializer = node.GetChildByRole(Roles.Expression)
+						};
+						if (context.DecompileRun.RecordDecompilers.TryGetValue(member.DeclaringTypeDefinition, out r))
+						{
+							i.Record = r;
+						}
+						info.Add((IMember)member, i);
+						break;
+					case IMethod m when m.IsConstructor:
+						i = new MemberTransformInfo((IMember)member, node);
+						if (context.DecompileRun.RecordDecompilers.TryGetValue(member.DeclaringTypeDefinition, out r))
+						{
+							i.Record = r;
+							i.IsPrimaryCtor = r.PrimaryConstructor == m;
+						}
+						info.Add((IMember)member, i);
+						break;
 				}
 			}
-		}
 
-		void HandleStaticFieldInitializers(IEnumerable<AstNode> members)
-		{
-			// Translate static constructor into field initializers if the class is BeforeFieldInit
-			var staticCtor = members.OfType<ConstructorDeclaration>().FirstOrDefault(c => (c.Modifiers & Modifiers.Static) == Modifiers.Static);
-			if (staticCtor != null)
+			if (currentType != null && context.DecompileRun.RecordDecompilers.TryGetValue(currentType, out var record))
 			{
-				bool ctorIsUnsafe = staticCtor.HasModifier(Modifiers.Unsafe);
-				IMethod ctorMethod = staticCtor.GetSymbol() as IMethod;
-				if (!ctorMethod.MetadataToken.IsNil)
+				foreach (var item in record.FieldsAndProperties)
 				{
-					var metadata = context.TypeSystem.MainModule.MetadataFile.Metadata;
-					SRM.MethodDefinition ctorMethodDef = metadata.GetMethodDefinition((SRM.MethodDefinitionHandle)ctorMethod.MetadataToken);
-					SRM.TypeDefinition declaringType = metadata.GetTypeDefinition(ctorMethodDef.GetDeclaringType());
-					bool declaringTypeIsBeforeFieldInit = declaringType.HasFlag(TypeAttributes.BeforeFieldInit);
-					int pos = 0;
-					while (pos < staticCtor.Body.Statements.Count)
+					if (item is IProperty p && record.IsPropertyDeclaredByPrimaryConstructor(p))
 					{
-						ExpressionStatement es = staticCtor.Body.Statements.ElementAtOrDefault(pos) as ExpressionStatement;
-						if (es == null)
-							break;
-						AssignmentExpression assignment = es.Expression as AssignmentExpression;
-						if (assignment == null || assignment.Operator != AssignmentOperatorType.Assign)
-							break;
-						IMember fieldOrProperty = (assignment.Left.GetSymbol() as IMember)?.MemberDefinition;
-						if (!(fieldOrProperty is IField || fieldOrProperty is IProperty) || !fieldOrProperty.IsStatic)
-							break;
-						// Only move fields that are constants, if the declaring type is not marked beforefieldinit.
-						if (!declaringTypeIsBeforeFieldInit && fieldOrProperty is not IField { IsConst: true })
+						info.Add(item.MemberDefinition, new MemberTransformInfo(item, null) { Record = record });
+					}
+				}
+			}
+
+			if (info.Count == 0)
+			{
+				return null;
+			}
+
+			// Analyze constructors
+			foreach (var item in info.Values)
+			{
+				if (item.Member is IMethod ctor)
+				{
+					bool isMarkedBeforeFieldInit = ctor.DeclaringTypeDefinition.GetMetadataAttributes().HasFlag(TypeAttributes.BeforeFieldInit);
+					var statements = ((ConstructorDeclaration)item.Syntax).Body.Statements;
+					foreach (var stmt in statements)
+					{
+						var m = fieldInitializerPattern.Match(stmt);
+						if (m.Success)
 						{
-							pos++;
-							continue;
-						}
-						var fieldOrPropertyDecl = members.FirstOrDefault(f => f.GetSymbol() == fieldOrProperty) as EntityDeclaration;
-						if (fieldOrPropertyDecl == null)
-							break;
-						if (ctorIsUnsafe && IntroduceUnsafeModifier.IsUnsafe(assignment.Right))
-						{
-							fieldOrPropertyDecl.Modifiers |= Modifiers.Unsafe;
-						}
-						if (fieldOrPropertyDecl is FieldDeclaration fd)
-						{
-							var v = fd.Variables.Single();
-							if (v.Initializer.IsNull)
+							IMember member = (m.Get<AstNode>("fieldAccess").Single().GetSymbol() as IMember)?.MemberDefinition;
+							if (!info.TryGetValue(member, out var memberInfo))
 							{
-								v.Initializer = assignment.Right.Detach();
+								break;
+							}
+							Expression initializer = m.Get<Expression>("initializer").Single();
+							if (memberInfo.Initializer == null || memberInfo.Initializer.IsNull)
+							{
+								memberInfo.Initializer = initializer;
+							}
+							else if (!memberInfo.Initializer.IsMatch(initializer))
+							{
+								return null;
+							}
+
+							if (initializer.GetResolveResult() is ILVariableResolveResult { Variable: { Kind: VariableKind.Parameter, Index: var index, Function.Method: var method } }
+								&& method == ctor && index >= 0 && index < method.Parameters.Count)
+							{
+								item.IsPrimaryCtor = true;
+							}
+
+							if (memberInfo.IsMemberDeclaredByPrimaryConstructor())
+							{
+
+							}
+							else if (!memberInfo.CanMoveExpressionToTypeLevel())
+							{
+								memberInfo.CanMoveInitializer = false;
+								break;
+							}
+
+							// in static ctors we only move constants, if the the type is marked beforefieldinit
+							if (ctor.IsStatic && !isMarkedBeforeFieldInit && member is not IField { IsConst: true })
+							{
+								memberInfo.CanMoveInitializer = false;
 							}
 							else
 							{
-								var constant = v.Initializer.GetResolveResult();
-								var expression = assignment.Right.GetResolveResult();
-								if (!(constant.IsCompileTimeConstant &&
-									TryEvaluateDecimalConstant(expression, out decimal value) &&
-									value.Equals(constant.ConstantValue)))
-								{
-									// decimal values do not match, abort transformation
-									break;
-								}
+								memberInfo.StatementsToRemove.Add(stmt);
 							}
+							continue;
 						}
-						else if (fieldOrPropertyDecl is PropertyDeclaration pd)
-						{
-							pd.Initializer = assignment.Right.Detach();
-						}
-						else
+						m = ctorCallPattern.Match(stmt);
+						if (!m.Success)
 						{
 							break;
 						}
-						es.Remove();
+						var expr = ((ExpressionStatement)stmt).Expression;
+						ISymbol symbol;
+						if (expr is AssignmentExpression { Right: ObjectCreateExpression oce })
+						{
+							// Pattern for value types:
+							// this = new TSelf(...);
+							symbol = oce.GetSymbol();
+							if (symbol is not IMethod { DeclaringTypeDefinition: var type } || type != item.Member.DeclaringTypeDefinition)
+							{
+								return null;
+							}
+						}
+						else
+						{
+							// Pattern for reference types:
+							// this..ctor(...);
+							symbol = expr.GetSymbol();
+						}
+						if (symbol is not IMethod { IsConstructor: true })
+						{
+							return null;
+						}
+
+						item.Initializer = expr;
+						break;
 					}
-					if (declaringTypeIsBeforeFieldInit && staticCtor.Body.Statements.Count == 0)
+				}
+			}
+
+			return new AnalysisResult(info);
+		}
+
+		void ApplyTransform(AnalysisResult result)
+		{
+			if (result == null)
+				return;
+
+			foreach (var item in result.TransformInfo.Values)
+			{
+				if (item.Initializer == null || item.Initializer.IsNull || !item.CanMoveInitializer)
+				{
+					continue;
+				}
+
+				switch (item.Syntax)
+				{
+					case FieldDeclaration field:
+						RemoveStatements(item);
+						field.Variables.Single().Initializer = item.Initializer.Detach();
+						if (IntroduceUnsafeModifier.IsUnsafe(item.Initializer))
+						{
+							field.Modifiers |= Modifiers.Unsafe;
+						}
+						break;
+					case PropertyDeclaration property:
+						RemoveStatements(item);
+						property.Initializer = item.Initializer.Detach();
+						break;
+					case EventDeclaration eventDeclaration:
+						RemoveStatements(item);
+						eventDeclaration.Variables.Single().Initializer = item.Initializer.Detach();
+						break;
+					case ConstructorDeclaration constructorDeclaration:
+						ConstructorInitializer ci;
+						switch (item.Initializer)
+						{
+							case InvocationExpression { Target: MemberReferenceExpression } invocation:
+								ci = new ConstructorInitializer();
+								var ctor = (IMethod)invocation.GetSymbol();
+								if (ctor.DeclaringTypeDefinition == item.Member.DeclaringTypeDefinition)
+									ci.ConstructorInitializerType = ConstructorInitializerType.This;
+								else
+									ci.ConstructorInitializerType = ConstructorInitializerType.Base;
+								// Move arguments from invocation to initializer:
+								invocation.Arguments.MoveTo(ci.Arguments);
+								// Add the initializer: (unless it is the default 'base()')
+								if (!(ci.ConstructorInitializerType == ConstructorInitializerType.Base && ci.Arguments.Count == 0))
+									constructorDeclaration.Initializer = ci.CopyAnnotationsFrom(invocation);
+								// Remove the statement:
+								item.Initializer.Parent.Remove();
+								break;
+							case AssignmentExpression { Right: ObjectCreateExpression oce }:
+								ci = new ConstructorInitializer();
+								ci.ConstructorInitializerType = ConstructorInitializerType.This;
+								// Move arguments from invocation to initializer:
+								oce.Arguments.MoveTo(ci.Arguments);
+								// Add the initializer:
+								constructorDeclaration.Initializer = ci.CopyAnnotationsFrom(oce);
+								// Remove the statement:
+								item.Initializer.Parent.Remove();
+								break;
+						}
+						break;
+					case null when item.Record != null:
+						RemoveStatements(item);
+						break;
+				}
+			}
+
+			MemberTransformInfo staticCtor = null;
+			List<MemberTransformInfo> ctors = new();
+			MemberTransformInfo primaryCtor = null;
+
+			foreach (var item in result.TransformInfo.Values)
+			{
+				if (item.Member is not IMethod { IsConstructor: true } ctor || item.Syntax is not ConstructorDeclaration declaration)
+				{
+					continue;
+				}
+
+				if (ctor.IsStatic)
+				{
+					staticCtor = item;
+				}
+				else
+				{
+					ctors.Add(item);
+					if (item.Record != null)
 					{
-						staticCtor.Remove();
+						if (item.Record.PrimaryConstructor == ctor)
+						{
+							primaryCtor = item;
+						}
 					}
+				}
+			}
+
+			if (staticCtor != null && CanHideConstructor((IMethod)staticCtor.Member, (ConstructorDeclaration)staticCtor.Syntax))
+			{
+				HideConstructor(staticCtor.Syntax);
+			}
+
+			if (ctors.Count == 1 && CanHideConstructor((IMethod)ctors[0].Member, (ConstructorDeclaration)ctors[0].Syntax))
+			{
+				HideConstructor(ctors[0].Syntax);
+			}
+			else if (primaryCtor?.Syntax is ConstructorDeclaration { Parent: TypeDeclaration typeDecl } declaration)
+			{
+				if (primaryCtor.Record != null)
+				{
+					if (primaryCtor.Record.IsInheritedRecord
+						&& declaration.Initializer is { ConstructorInitializerType: ConstructorInitializerType.Base } ci
+						&& typeDecl.BaseTypes.Count >= 1)
+					{
+						var baseType = typeDecl.BaseTypes.First();
+						var newBaseType = new InvocationAstType();
+						baseType.ReplaceWith(newBaseType);
+						newBaseType.BaseType = baseType;
+						ci.Arguments.MoveTo(newBaseType.Arguments);
+					}
+					HideConstructor(declaration);
+				}
+			}
+
+			void HideConstructor(AstNode declaration)
+			{
+				if (declaration.Parent is not SyntaxTree || declaration.Parent.Children.Skip(1).Any())
+				{
+					declaration.Remove();
+				}
+			}
+
+			bool CanHideConstructor(IMethod ctor, ConstructorDeclaration declaration)
+			{
+				// keep ctor because it is not empty
+				if (declaration.Body.Statements.Count != 0)
+				{
+					return false;
+				}
+
+				// keep ctor because there is XMLDoc on the item
+				if (context.Settings.ShowXmlDocumentation && context.DecompileRun.DocumentationProvider?.GetDocumentation(ctor) != null)
+				{
+					return false;
+				}
+
+				// keep ctor because of initializer
+				if (!declaration.Initializer.IsNull)
+				{
+					return false;
+				}
+
+				// non-empty parameter list, keep the declaration
+				if (ctor.Parameters.Count > 0)
+				{
+					return false;
+				}
+
+				if (ctor.IsStatic)
+				{
+					// keep static ctor because the containing type is not marked beforefieldinit
+					bool isMarkedBeforeFieldInit = ctor.DeclaringTypeDefinition.GetMetadataAttributes().HasFlag(TypeAttributes.BeforeFieldInit);
+					if (!isMarkedBeforeFieldInit)
+					{
+						return false;
+					}
+				}
+				else
+				{
+					// non-default visibility, keep the declaration
+					if (ctor.Accessibility != (ctor.DeclaringTypeDefinition.IsAbstract ? Accessibility.Protected : Accessibility.Public))
+					{
+						return false;
+					}
+				}
+
+				return true;
+			}
+
+			void RemoveStatements(MemberTransformInfo info)
+			{
+				foreach (var item in info.StatementsToRemove)
+				{
+					item.Remove();
 				}
 			}
 		}
 
-		/// <summary>
-		/// Evaluates a call to the decimal-ctor.
-		/// </summary>
-		private bool TryEvaluateDecimalConstant(Semantics.ResolveResult expression, out decimal value)
+		public override void VisitTypeDeclaration(TypeDeclaration typeDeclaration)
 		{
-			value = 0;
-			if (!expression.Type.IsKnownType(KnownTypeCode.Decimal))
-			{
-				return false;
-			}
-			switch (expression)
-			{
-				case CSharpInvocationResolveResult rr:
-					if (!(rr.GetSymbol() is IMethod { SymbolKind: SymbolKind.Constructor } ctor))
-						return false;
-					var args = rr.GetArgumentsForCall();
-					if (args.Count == 1)
-					{
-						switch (args[0].ConstantValue)
-						{
-							case double d:
-								value = new decimal(d);
-								return true;
-							case float f:
-								value = new decimal(f);
-								return true;
-							case long l:
-								value = new decimal(l);
-								return true;
-							case int i:
-								value = new decimal(i);
-								return true;
-							case ulong ul:
-								value = new decimal(ul);
-								return true;
-							case uint ui:
-								value = new decimal(ui);
-								return true;
-							case int[] bits when bits.Length == 4 && (bits[3] & 0x7F00FFFF) == 0 && (bits[3] & 0xFF000000) <= 0x1C000000:
-								value = new decimal(bits);
-								return true;
-							default:
-								return false;
-						}
-					}
-					else if (args.Count == 5 &&
-						args[0].ConstantValue is int lo &&
-						args[1].ConstantValue is int mid &&
-						args[2].ConstantValue is int hi &&
-						args[3].ConstantValue is bool isNegative &&
-						args[4].ConstantValue is byte scale)
-					{
-						value = new decimal(lo, mid, hi, isNegative, scale);
-						return true;
-					}
-					return false;
-				default:
-					if (expression.ConstantValue is decimal v)
-					{
-						value = v;
-						return true;
-					}
-					return false;
-			}
+			var result = Analyze(typeDeclaration.Members, (ITypeDefinition)typeDeclaration.GetSymbol());
+			ApplyTransform(result);
+			base.VisitTypeDeclaration(typeDeclaration);
 		}
 	}
 }

@@ -23,3 +23,11 @@ namespace System.Diagnostics.CodeAnalysis
 		}
 	}
 }
+
+// poly-fill for records
+namespace System.Runtime.CompilerServices
+{
+	internal static class IsExternalInit
+	{
+	}
+}

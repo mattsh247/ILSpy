@@ -38,6 +38,17 @@ namespace ICSharpCode.Decompiler.Tests.TestCases.Pretty
 			}
 		}
 
+		public class ClassWithStaticMembers
+		{
+			public static readonly int PI = 3;
+			public static readonly double PI2 = 6.28;
+			public static EventHandler Event = delegate {
+			};
+#if CS60
+			public static bool Active { get; set; } = true;
+#endif
+		}
+
 		public class ClassWithConstant
 		{
 			// using decimal constants has the effect that there is a cctor
