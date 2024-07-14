@@ -41,12 +41,26 @@ namespace ICSharpCode.Decompiler.CSharp.Transforms
 			public RecordDecompiler Record { get; set; }
 			public bool IsPrimaryCtor { get; set; }
 
+			public IParameter AssociatedPrimaryConstructorParameter { get; set; }
+
+			public bool IsCompilerGeneratedPrimaryConstructorParameterBackingField()
+			{
+				return Member.SymbolKind == SymbolKind.Field
+					&& Member.Name.StartsWith("<", System.StringComparison.Ordinal)
+					&& Member.Name.EndsWith(">P", System.StringComparison.Ordinal)
+					&& Member.IsCompilerGenerated();
+			}
+
 			public bool IsMemberDeclaredByPrimaryConstructor()
 			{
 				if (Record != null)
 				{
 					if (Member is IProperty p && Record.IsPropertyDeclaredByPrimaryConstructor(p))
 						return true;
+				}
+				else if (IsCompilerGeneratedPrimaryConstructorParameterBackingField())
+				{
+					return true;
 				}
 
 				return false;
@@ -67,7 +81,7 @@ namespace ICSharpCode.Decompiler.CSharp.Transforms
 					if (i is ILoadInstruction load)
 					{
 						var f = load.Variable.Function.Method;
-						if (load.Variable.Kind.IsLocal() || load.Variable.Kind == VariableKind.Parameter)
+						if (load.Variable.Kind.IsLocal())
 						{
 							if (f.IsConstructor)
 							{
@@ -217,6 +231,7 @@ namespace ICSharpCode.Decompiler.CSharp.Transforms
 							if (initializer.GetResolveResult() is ILVariableResolveResult { Variable: { Kind: VariableKind.Parameter, Index: var index, Function.Method: var method } }
 								&& method == ctor && index >= 0 && index < method.Parameters.Count)
 							{
+								memberInfo.AssociatedPrimaryConstructorParameter = method.Parameters[index.Value];
 								item.IsPrimaryCtor = true;
 							}
 
@@ -370,6 +385,10 @@ namespace ICSharpCode.Decompiler.CSharp.Transforms
 							primaryCtor = item;
 						}
 					}
+					else if (declaration.Initializer?.ConstructorInitializerType != ConstructorInitializerType.This && declaration.Body.Statements.Count == 0 && item.IsPrimaryCtor)
+					{
+						primaryCtor = item;
+					}
 				}
 			}
 
@@ -397,6 +416,53 @@ namespace ICSharpCode.Decompiler.CSharp.Transforms
 						ci.Arguments.MoveTo(newBaseType.Arguments);
 					}
 					HideConstructor(declaration);
+				}
+				else
+				{
+					declaration.Parameters.MoveTo(typeDecl.PrimaryConstructorParameters);
+
+					if (declaration.Initializer is { ConstructorInitializerType: ConstructorInitializerType.Base } ci
+						&& typeDecl.BaseTypes.Count >= 1)
+					{
+						var baseType = typeDecl.BaseTypes.First();
+						var newBaseType = new InvocationAstType();
+						baseType.ReplaceWith(newBaseType);
+						newBaseType.BaseType = baseType;
+						ci.Arguments.MoveTo(newBaseType.Arguments);
+					}
+
+					declaration.Remove();
+
+					foreach (var field in result.TransformInfo.Values)
+					{
+						if (field.IsCompilerGeneratedPrimaryConstructorParameterBackingField())
+						{
+							field.Syntax.Remove();
+							var attributes = field.Member.GetAttributes()
+								.Where(a => !PatternStatementTransform.attributeTypesToRemoveFromAutoProperties.Contains(a.AttributeType.FullName))
+								.Select(context.TypeSystemAstBuilder.ConvertAttribute).ToArray();
+							if (attributes.Length > 0)
+							{
+								var section = new AttributeSection {
+									AttributeTarget = "field"
+								};
+								section.Attributes.AddRange(attributes);
+								foreach (var pd in typeDecl.PrimaryConstructorParameters)
+								{
+									if (pd.GetSymbol() == field.AssociatedPrimaryConstructorParameter)
+										pd.Attributes.Add(section);
+								}
+							}
+
+							foreach (var identifier in typeDecl.Descendants.OfType<IdentifierExpression>())
+							{
+								if (identifier.GetSymbol() == field.Member)
+								{
+									identifier.ReplaceWith(field.Initializer.Clone());
+								}
+							}
+						}
+					}
 				}
 			}
 

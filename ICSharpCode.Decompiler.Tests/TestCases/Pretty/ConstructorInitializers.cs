@@ -91,5 +91,35 @@ namespace ICSharpCode.Decompiler.Tests.TestCases.Pretty
 			public unsafe static int StaticSizeOf = sizeof(SimpleStruct);
 			public unsafe int SizeOf = sizeof(SimpleStruct);
 		}
+
+#if CS120
+		public class ClassWithPrimaryCtorUsingGlobalParameter(int a)
+		{
+			public void Print()
+			{
+				Console.WriteLine(a);
+			}
+		}
+
+		public class ClassWithPrimaryCtorUsingGlobalParameterAssignedToField(int a)
+		{
+			private readonly int a = a;
+
+			public void Print()
+			{
+				Console.WriteLine(a);
+			}
+		}
+
+		public class ClassWithPrimaryCtorUsingGlobalParameterAssignedToFieldAndUsedInMethod(int a)
+		{
+			private readonly int _a = a;
+
+			public void Print()
+			{
+				Console.WriteLine(a);
+			}
+		}
+#endif
 	}
 }

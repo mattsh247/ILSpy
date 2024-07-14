@@ -339,6 +339,8 @@ namespace ICSharpCode.Decompiler.CSharp
 					{
 						if (settings.AnonymousMethods && IsAnonymousMethodCacheField(field, metadata))
 							return true;
+						if (settings.UsePrimaryConstructorSyntax && IsPrimaryConstructorParameterBackingField(field, metadata))
+							return true;
 						if (settings.AutomaticProperties && IsAutomaticPropertyBackingField(field, metadata, out var propertyName))
 						{
 							if (!settings.GetterOnlyAutomaticProperties && IsGetterOnlyProperty(propertyName))
@@ -437,6 +439,12 @@ namespace ICSharpCode.Decompiler.CSharp
 		{
 			var name = metadata.GetString(field.Name);
 			return name.StartsWith("CS$<>", StringComparison.Ordinal) || name.StartsWith("<>f__am", StringComparison.Ordinal) || name.StartsWith("<>f__mg", StringComparison.Ordinal);
+		}
+
+		static bool IsPrimaryConstructorParameterBackingField(SRM.FieldDefinition field, MetadataReader metadata)
+		{
+			var name = metadata.GetString(field.Name);
+			return name.StartsWith("<", StringComparison.Ordinal) && name.EndsWith(">P", StringComparison.Ordinal);
 		}
 
 		static bool IsClosureType(SRM.TypeDefinition type, MetadataReader metadata)
